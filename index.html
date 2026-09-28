@@ -78,7 +78,7 @@
                 Quy tắc nạp đáp án tự động (Mới)
             </h3>
             <ul class="mt-2 text-[13px] text-indigo-700 list-disc list-inside space-y-1">
-                <li><b>Phần 2 (Đúng/Sai):</b> Gõ thêm <b>Đ</b> hoặc <b>S</b> vào cuối mỗi phương án (Ví dụ: <i>A. a) Hàm số đồng biến. Đ</i>). Hệ thống sẽ tự lọc đáp án và ẩn chữ Đ/S này đi khi xuất đề.</li>
+                <li><b>Phần 2 (Đúng/Sai):</b> Gõ <b>Đ</b> hoặc <b>S</b> ở ngay đầu mỗi phương án (Ví dụ: <i>a) Đ. Hàm số đồng biến</i> hoặc <i>A. S Hàm số...</i>). Hệ thống sẽ tự lọc đáp án và ẩn chữ Đ/S này đi khi xuất đề.</li>
                 <li><b>Phần 3 (Trả lời ngắn):</b> Gõ <b>Đáp án: [Nội dung]</b> ở dòng dưới cùng của câu hỏi (trước khi sang câu mới). Hệ thống sẽ bóc tách cả công thức Toán học vào bảng đáp án.</li>
             </ul>
         </div>
@@ -103,7 +103,7 @@
                     </div>
                     
                     <button id="btn-analyze" onclick="analyzeFile()" disabled class="mt-5 w-full bg-slate-800 text-white font-semibold py-3 rounded-xl shadow-lg shadow-slate-200 hover:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none transition-all flex justify-center items-center">
-                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 002-2M9 5a2 2 0 012-2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>
                         Phân Tích Đề
                     </button>
                 </div>
@@ -250,11 +250,11 @@ def get_para_elements(paragraph):
         if tag == qn('w:r'):
             t = _DocxRun(child, paragraph).text or ""
         else:
-            t = " " # Giữ chỗ cho công thức toán hoặc hình ảnh (w:drawing/m:oMath)
+            t = " " 
             
         length = len(t)
         if length == 0:
-            t = "\u200B" # Zero-width space
+            t = "\u200B"
             length = 1
             
         spans.append((pos, pos + length, child, t))
@@ -351,36 +351,43 @@ def _make_para_spec(paragraph, a=0, b=None, number_span=None):
     segments = _seg_slice(spans, a, b, number_span)
     return ParaSpec(paragraph, segments)
 
-def _extract_tf_answer(segments):
+# Thuật toán trích xuất Đ/S ở NGAY ĐẦU phương án lựa chọn
+def _extract_tf_answer_start(segments):
     text = ""
     for el, sliced_t, ns, is_num in segments:
         if el.tag == qn('w:r'):
             text += sliced_t
     
-    # Tìm kiếm Đ hoặc S ở cuối chuỗi
-    m = re.search(r'\s+([ĐSđs])\s*\.?\s*$', text)
+    # Nhận diện Đ hoặc S ở ngay đầu phương án (sau ký tự A. b) ...)
+    m = re.match(r'^(\s*(?:[A-Dabcd][\.\)]\s*)*)([ĐSđs])([\.\s:]+|$)', text)
     if not m:
         return segments, None
         
-    tf_ans = m.group(1).upper()
-    to_remove = len(m.group(0))
+    tf_ans = m.group(2).upper()
     
-    # Cắt Đ/S khỏi segments để ẩn khỏi đề in
+    start_remove = len(m.group(1))
+    len_remove = len(m.group(2)) + len(m.group(3))
+    
     new_segments = []
-    removed = 0
-    for el, sliced_t, ns, is_num in reversed(segments):
-        if removed < to_remove and el.tag == qn('w:r'):
+    current_pos = 0
+    
+    for el, sliced_t, ns, is_num in segments:
+        if el.tag == qn('w:r'):
             l = len(sliced_t)
-            if removed + l <= to_remove:
-                removed += l
-                new_segments.insert(0, (el, "", True, is_num))
+            if current_pos >= start_remove + len_remove:
+                new_segments.append((el, sliced_t, ns, is_num))
+            elif current_pos + l <= start_remove:
+                new_segments.append((el, sliced_t, ns, is_num))
             else:
-                rem_here = to_remove - removed
-                new_sliced_t = sliced_t[:-rem_here]
-                removed = to_remove
-                new_segments.insert(0, (el, new_sliced_t, True, is_num))
+                keep_left = max(0, start_remove - current_pos)
+                end_remove = start_remove + len_remove
+                keep_right_start = max(0, end_remove - current_pos)
+                
+                new_t = sliced_t[:keep_left] + sliced_t[keep_right_start:]
+                new_segments.append((el, new_t, True, is_num))
+            current_pos += l
         else:
-            new_segments.insert(0, (el, sliced_t, ns, is_num))
+            new_segments.append((el, sliced_t, ns, is_num))
             
     return new_segments, tf_ans
 
@@ -396,7 +403,7 @@ def _mark_option_correctness(segments):
                     is_correct = True
                     break
     
-    new_segments, tf_ans = _extract_tf_answer(segments)
+    new_segments, tf_ans = _extract_tf_answer_start(segments)
     return new_segments, is_correct, tf_ans
 
 def _extract_inline_options(paragraph, options_text_start):
