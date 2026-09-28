@@ -214,14 +214,21 @@ from docx.oxml.ns import qn
 from docx.text.run import Run as _DocxRun
 from docx.oxml import OxmlElement
 
-QUESTION_RE = re.compile(r'Câu\s+(\d+)\s*\.', re.IGNORECASE)
+QUESTION_RE = re.compile(r'^\s*Câu\s+(\d+)\s*\.', re.IGNORECASE)
+PART_HEAD_RE = re.compile(r'^\s*PHẦN\s+[IVX\d]+', re.IGNORECASE)
+STMT_START_RE = re.compile(r'^\s*([abcd])\)\s')
 PART_RE = re.compile(r'PHẦN\s+([IVX123]+)', re.IGNORECASE)
 OPTION_START_RE = re.compile(r'^\s*([ABCD])\.\s')
 INLINE_OPTIONS_RE = re.compile(r'(?P<A>A\.\s.*?)(?=\t?\s*B\.\s)\t?\s*(?P<B>B\.\s.*?)(?=\t?\s*C\.\s)\t?\s*(?P<C>C\.\s.*?)(?=\t?\s*D\.\s)\t?\s*(?P<D>D\.\s.*)$', re.DOTALL)
 CIRCLED = {"A": "\u24B6", "B": "\u24B7", "C": "\u24B8", "D": "\u24B9"}
 
 # THUẬT TOÁN MỚI: Đọc nguyên trạng thẻ XML thay vì chỉ đọc Text
+class _TableItem:
+    is_table = True
+    def __init__(self, tbl): self._p = tbl
+
 def get_para_elements(paragraph):
+    if getattr(paragraph, 'is_table', False): return [], ""
     spans = []
     pos = 0
     full_text = ""
@@ -267,10 +274,11 @@ def copy_ppr(new_paragraph, source_paragraph):
         new_paragraph._p.insert(0, new_ppr)
 
 class ParaSpec:
-    __slots__ = ("source_paragraph", "segments")
+    __slots__ = ("source_paragraph", "segments", "table")
     def __init__(self, source_paragraph, segments):
         self.source_paragraph = source_paragraph
         self.segments = segments
+        self.table = None
 
 class Option:
     __slots__ = ("letter_orig", "segments", "is_correct")
@@ -280,7 +288,7 @@ class Option:
         self.is_correct = is_correct
 
 class QuestionBlock:
-    __slots__ = ("id", "number", "stem_paragraphs", "options", "options_mode", "options_ppr_source")
+    __slots__ = ("id", "number", "stem_paragraphs", "options", "options_mode", "options_ppr_source", "options_ppr_source2")
     def __init__(self, qid, number):
         self.id = qid
         self.number = number
@@ -288,6 +296,7 @@ class QuestionBlock:
         self.options = []
         self.options_mode = None
         self.options_ppr_source = None
+        self.options_ppr_source2 = None
 
 # Thuật toán cắt XML siêu an toàn để không làm hỏng MathType/Equation
 def _seg_slice(spans, a, b, number_span=None):
@@ -323,6 +332,8 @@ def _seg_slice(spans, a, b, number_span=None):
     return segments
 
 def _make_para_spec(paragraph, a=0, b=None, number_span=None):
+    if getattr(paragraph, 'is_table', False):
+        sp = ParaSpec(paragraph, []); sp.table = paragraph._p; return sp
     spans, full_text = get_para_elements(paragraph)
     if b is None: b = len(full_text)
     segments = _seg_slice(spans, a, b, number_span)
@@ -358,9 +369,20 @@ def _extract_inline_options(paragraph, options_text_start):
     stem_end_abs = options_text_start + m.start('A')
     return options, stem_end_abs
 
-def _extract_separate_options(paragraphs4):
+def _extract_pair(paragraph, la, lb):
+    spans, full_text = get_para_elements(paragraph)
+    m = re.search(r'(?P<X>%s\.\s.*?)(?=\t?\s*%s\.\s)\t?\s*(?P<Y>%s\.\s.*)$' % (la, lb, lb), full_text, re.DOTALL)
+    if not m: return None
+    out = []
+    for letter, key in ((la, "X"), (lb, "Y")):
+        segs = _seg_slice(spans, m.start(key), m.end(key))
+        segs, ok = _mark_option_correctness(segs)
+        out.append(Option(letter, segs, ok))
+    return out
+
+def _extract_separate_options(paragraphs4, letters="ABCD"):
     options = []
-    for letter, p in zip("ABCD", paragraphs4):
+    for letter, p in zip(letters, paragraphs4):
         spans, full_text = get_para_elements(p)
         segs = _seg_slice(spans, 0, len(full_text))
         segs, is_correct = _mark_option_correctness(segs)
@@ -369,7 +391,11 @@ def _extract_separate_options(paragraphs4):
 
 def parse_exam(docx_path):
     doc = Document(docx_path)
-    paragraphs = doc.paragraphs
+    from docx.text.paragraph import Paragraph
+    paragraphs = []
+    for child in doc.element.body:
+        if child.tag == qn('w:p'): paragraphs.append(Paragraph(child, doc._body))
+        elif child.tag == qn('w:tbl'): paragraphs.append(_TableItem(child))
     n = len(paragraphs)
     marker_at, marker_span_at = {}, {}
     for i, p in enumerate(paragraphs):
@@ -407,6 +433,7 @@ def parse_exam(docx_path):
             while cursor < next_marker_idx:
                 p = paragraphs[cursor]
                 text = para_text(p)
+                if PART_HEAD_RE.match(text): break
                 if OPTION_START_RE.match(text):
                     m_inline = INLINE_OPTIONS_RE.search(text)
                     if m_inline and m_inline.start('A') == 0:
@@ -429,6 +456,28 @@ def parse_exam(docx_path):
                             cursor += 4
                             found_options = True
                             break
+                if re.match(r'^\s*A\.\s', text) and cursor + 1 < next_marker_idx and re.match(r'^\s*C\.\s', para_text(paragraphs[cursor + 1])):
+                    ab = _extract_pair(p, 'A', 'B')
+                    cd = _extract_pair(paragraphs[cursor + 1], 'C', 'D')
+                    if ab and cd:
+                        qb.options = ab + cd
+                        qb.options_mode = 'two_lines'
+                        qb.options_ppr_source = p
+                        qb.options_ppr_source2 = paragraphs[cursor + 1]
+                        cursor += 2
+                        found_options = True
+                        break
+                ms = STMT_START_RE.match(text)
+                if ms and ms.group(1) == 'a' and cursor + 3 < next_marker_idx:
+                    rest = [paragraphs[cursor + k] for k in (1, 2, 3)]
+                    ms2 = [STMT_START_RE.match(para_text(r)) for r in rest]
+                    if all(ms2) and [m_.group(1) for m_ in ms2] == ['b', 'c', 'd']:
+                        qb.options = _extract_separate_options([p] + rest, "abcd")
+                        qb.options_mode = 'separate'
+                        qb.options_ppr_source = p
+                        cursor += 4
+                        found_options = True
+                        break
                 qb.stem_paragraphs.append(_make_para_spec(p))
                 cursor += 1
             if not found_options:
@@ -682,7 +731,19 @@ def _copy_seg_run(paragraph, seg, new_number_str, num_replaced, strip_underline=
                     
     paragraph._p.append(new_el)
 
+def _emit_table(doc, spec):
+    body = doc.element.body
+    new_tbl = copy.deepcopy(spec.table)
+    sect = body.find(qn('w:sectPr'))
+    if sect is not None: sect.addprevious(new_tbl)
+    else: body.append(new_tbl)
+
+def _lab(opt, i):
+    return ("abcd" if opt.letter_orig in "abcd" else "ABCD")[i]
+
 def _emit_plain_paragraph(doc, spec):
+    if spec.table is not None:
+        return _emit_table(doc, spec)
     p = doc.add_paragraph()
     copy_ppr(p, spec.source_paragraph)
     num_replaced = [False]
@@ -744,9 +805,12 @@ def render_exam_docx(parsed, global_header, blocks, option_perm, number_str_map,
                     if i > 0:
                         tab_run = p.add_run("\t")
                         if opt.segments: copy_rpr(tab_run._r, opt.segments[0][0], strip_underline=True)
-                    _emit_option_run(p, opt, "ABCD"[i], True)
+                    _emit_option_run(p, opt, _lab(opt, i), True)
             else:
                 for sp in q.stem_paragraphs:
+                    if sp.table is not None:
+                        _emit_table(doc, sp)
+                        continue
                     p = doc.add_paragraph()
                     copy_ppr(p, sp.source_paragraph)
                     num_replaced = [False]
@@ -760,12 +824,21 @@ def render_exam_docx(parsed, global_header, blocks, option_perm, number_str_map,
                         if i > 0:
                             tab_run = p.add_run("\t")
                             if opt.segments: copy_rpr(tab_run._r, opt.segments[0][0], strip_underline=True)
-                        _emit_option_run(p, opt, "ABCD"[i], True)
+                        _emit_option_run(p, opt, _lab(opt, i), True)
+                elif q.options_mode == 'two_lines':
+                    for k, src in enumerate((q.options_ppr_source, q.options_ppr_source2)):
+                        p = doc.add_paragraph()
+                        copy_ppr(p, src)
+                        for i in (2 * k, 2 * k + 1):
+                            if i % 2 == 1:
+                                tab_run = p.add_run("\t")
+                                if opts[i].segments: copy_rpr(tab_run._r, opts[i].segments[0][0], strip_underline=True)
+                            _emit_option_run(p, opts[i], _lab(opts[i], i), True)
                 elif q.options_mode == 'separate':
                     for i, opt in enumerate(opts):
                         p = doc.add_paragraph()
                         copy_ppr(p, q.options_ppr_source)
-                        _emit_option_run(p, opt, "ABCD"[i], True)
+                        _emit_option_run(p, opt, _lab(opt, i), True)
 
             for spec in block["specs_internal"].get(old_q_id, []): 
                 _emit_plain_paragraph(doc, spec)
@@ -778,8 +851,12 @@ def compute_answer_key(new_order, option_perm, number_str_map):
     for old_q_id in new_order:
         opts = option_perm[old_q_id]
         correct_letter = None
-        for i, opt in enumerate(opts):
-            if opt.is_correct: correct_letter = "ABCD"[i]; break
+        if opts and opts[0].letter_orig in "abcd":
+            if any(o.is_correct for o in opts):
+                correct_letter = "".join("Đ" if o.is_correct else "S" for o in opts)
+        else:
+            for i, opt in enumerate(opts):
+                if opt.is_correct: correct_letter = "ABCD"[i]; break
         result.append((number_str_map[old_q_id], correct_letter))
     return result
 
@@ -793,7 +870,7 @@ def build_answer_key_docx(all_keys, out_path):
         for i in range(0, len(keys), 10):
             row_cells = table.add_row().cells
             for j, (num_str, letter) in enumerate(keys[i:i + 10]):
-                shown = CIRCLED.get(letter, "?") if letter else "?"
+                shown = CIRCLED.get(letter, letter) if letter else "?"
                 row_cells[j].text = f"{num_str}. {shown}"
     doc.save(out_path)
 </script>
@@ -837,8 +914,10 @@ def generate_shuffled(options_json):
         header_line = f"Mã đề: {ma_de}" if insert_header else None
         out_path = f"/MaDe_{ma_de}.docx"
         engine.render_exam_docx(G_PARSED, global_header, blocks, option_perm, number_str_map, out_path, header_line=header_line)
-        keys = engine.compute_answer_key(new_order, option_perm, number_str_map)
-        all_keys.append((f"Mã đề {ma_de}", keys))
+        for b in blocks:
+            ks = engine.compute_answer_key(b["qids"], option_perm, number_str_map)
+            lbl = f"Mã đề {ma_de}" if len(blocks) == 1 else f"Mã đề {ma_de} – Phần {(b['part_idx'] or 0) + 1}"
+            all_keys.append((lbl, ks))
         
         with open(out_path, 'rb') as f:
             out_files[f"MaDe_{ma_de}.docx"] = base64.b64encode(f.read()).decode('utf-8')
