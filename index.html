@@ -36,7 +36,7 @@
         .animate-fade-in { animation: fadeIn 0.5s ease-out forwards; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-        /* Nền họa tiết (Blob background) */
+        /* Nền họa tiết */
         .bg-blobs {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -1; overflow: hidden; background: #f8fafc;
         }
@@ -46,7 +46,6 @@
 </head>
 <body class="text-slate-800 min-h-screen relative">
     
-    <!-- Background Decor -->
     <div class="bg-blobs">
         <div class="blob-1"></div>
         <div class="blob-2"></div>
@@ -72,11 +71,21 @@
     </header>
 
     <main class="max-w-7xl mx-auto px-6 py-8 relative z-10">
+        <!-- Notification Box -->
+        <div class="mb-6 bg-indigo-50 border-l-4 border-indigo-500 p-4 rounded-r-lg shadow-sm">
+            <h3 class="text-sm font-bold text-indigo-800 flex items-center">
+                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                Quy tắc nạp đáp án tự động (Mới)
+            </h3>
+            <ul class="mt-2 text-[13px] text-indigo-700 list-disc list-inside space-y-1">
+                <li><b>Phần 2 (Đúng/Sai):</b> Gõ thêm <b>Đ</b> hoặc <b>S</b> vào cuối mỗi phương án (Ví dụ: <i>A. a) Hàm số đồng biến. Đ</i>). Hệ thống sẽ tự lọc đáp án và ẩn chữ Đ/S này đi khi xuất đề.</li>
+                <li><b>Phần 3 (Trả lời ngắn):</b> Gõ <b>Đáp án: [Nội dung]</b> ở dòng dưới cùng của câu hỏi (trước khi sang câu mới). Hệ thống sẽ bóc tách cả công thức Toán học vào bảng đáp án.</li>
+            </ul>
+        </div>
+
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            
             <!-- CỘT TRÁI (Nhập file & Cấu hình xuất) -->
             <div class="lg:col-span-4 space-y-6">
-                
                 <!-- BƯỚC 1: TẢI ĐỀ -->
                 <div class="glass-card rounded-2xl p-6">
                     <div class="flex items-center mb-5">
@@ -94,7 +103,7 @@
                     </div>
                     
                     <button id="btn-analyze" onclick="analyzeFile()" disabled class="mt-5 w-full bg-slate-800 text-white font-semibold py-3 rounded-xl shadow-lg shadow-slate-200 hover:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none transition-all flex justify-center items-center">
-                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 002-2M9 5a2 2 0 012-2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>
                         Phân Tích Đề
                     </button>
                 </div>
@@ -222,6 +231,9 @@ OPTION_START_RE = re.compile(r'^\s*([ABCD])\.\s')
 INLINE_OPTIONS_RE = re.compile(r'(?P<A>A\.\s.*?)(?=\t?\s*B\.\s)\t?\s*(?P<B>B\.\s.*?)(?=\t?\s*C\.\s)\t?\s*(?P<C>C\.\s.*?)(?=\t?\s*D\.\s)\t?\s*(?P<D>D\.\s.*)$', re.DOTALL)
 CIRCLED = {"A": "\u24B6", "B": "\u24B7", "C": "\u24B8", "D": "\u24B9"}
 
+# Mẫu nhận diện Đáp án Trả lời ngắn (Phần 3)
+ANS_RE = re.compile(r'^\s*(?:Đáp\s*án|ĐS|Kết\s*quả|ĐÁP\s*ÁN)\s*[:\.]', re.IGNORECASE)
+
 class _TableItem:
     is_table = True
     def __init__(self, tbl): self._p = tbl
@@ -242,7 +254,7 @@ def get_para_elements(paragraph):
             
         length = len(t)
         if length == 0:
-            t = "\u200B" # Zero-width space để định vị
+            t = "\u200B" # Zero-width space
             length = 1
             
         spans.append((pos, pos + length, child, t))
@@ -280,14 +292,15 @@ class ParaSpec:
         self.table = None
 
 class Option:
-    __slots__ = ("letter_orig", "segments", "is_correct")
-    def __init__(self, letter_orig, segments, is_correct):
+    __slots__ = ("letter_orig", "segments", "is_correct", "tf_ans")
+    def __init__(self, letter_orig, segments, is_correct, tf_ans=None):
         self.letter_orig = letter_orig
         self.segments = segments
         self.is_correct = is_correct
+        self.tf_ans = tf_ans
 
 class QuestionBlock:
-    __slots__ = ("id", "number", "stem_paragraphs", "options", "options_mode", "options_ppr_source", "options_ppr_source2")
+    __slots__ = ("id", "number", "stem_paragraphs", "options", "options_mode", "options_ppr_source", "options_ppr_source2", "short_answer_spec")
     def __init__(self, qid, number):
         self.id = qid
         self.number = number
@@ -296,6 +309,7 @@ class QuestionBlock:
         self.options_mode = None
         self.options_ppr_source = None
         self.options_ppr_source2 = None
+        self.short_answer_spec = None
 
 def _seg_slice(spans, a, b, number_span=None):
     segments = []
@@ -310,7 +324,7 @@ def _seg_slice(spans, a, b, number_span=None):
         if el.tag == qn('w:r'):
             local_splits = sorted(list(set(sp - s for sp in splits if s < sp < e)))
             curr = 0
-            needs_slicing = len(local_splits) > 0 # Chìa khóa: Nếu Run không vướng ranh giới cắt thì không chạm vào text bên trong
+            needs_slicing = len(local_splits) > 0 
             for ls in local_splits + [len(t)]:
                 if curr == ls: continue
                 chunk_s = s + curr
@@ -325,7 +339,6 @@ def _seg_slice(spans, a, b, number_span=None):
                 segments.append((el, sliced_t, needs_slicing, is_num))
                 curr = ls
         else:
-            # Giữ nguyên khối XML đối với hình ảnh và công thức
             segments.append((el, t, False, False))
             
     return segments
@@ -338,20 +351,53 @@ def _make_para_spec(paragraph, a=0, b=None, number_span=None):
     segments = _seg_slice(spans, a, b, number_span)
     return ParaSpec(paragraph, segments)
 
+def _extract_tf_answer(segments):
+    text = ""
+    for el, sliced_t, ns, is_num in segments:
+        if el.tag == qn('w:r'):
+            text += sliced_t
+    
+    # Tìm kiếm Đ hoặc S ở cuối chuỗi
+    m = re.search(r'\s+([ĐSđs])\s*\.?\s*$', text)
+    if not m:
+        return segments, None
+        
+    tf_ans = m.group(1).upper()
+    to_remove = len(m.group(0))
+    
+    # Cắt Đ/S khỏi segments để ẩn khỏi đề in
+    new_segments = []
+    removed = 0
+    for el, sliced_t, ns, is_num in reversed(segments):
+        if removed < to_remove and el.tag == qn('w:r'):
+            l = len(sliced_t)
+            if removed + l <= to_remove:
+                removed += l
+                new_segments.insert(0, (el, "", True, is_num))
+            else:
+                rem_here = to_remove - removed
+                new_sliced_t = sliced_t[:-rem_here]
+                removed = to_remove
+                new_segments.insert(0, (el, new_sliced_t, True, is_num))
+        else:
+            new_segments.insert(0, (el, sliced_t, ns, is_num))
+            
+    return new_segments, tf_ans
+
 def _mark_option_correctness(segments):
-    if not segments: return segments, False
+    if not segments: return segments, False, None
     is_correct = False
     for el, sliced_t, needs_slicing, is_num in segments:
         if el.tag == qn('w:r'):
             rpr = el.find(qn('w:rPr'))
             if rpr is not None:
                 u = rpr.find(qn('w:u'))
-                if u is not None:
-                    val = u.get(qn('w:val'))
-                    if val not in (None, 'none', '0', 'false'):
-                        is_correct = True
-                        break
-    return segments, is_correct
+                if u is not None and u.get(qn('w:val')) not in (None, 'none', '0', 'false'):
+                    is_correct = True
+                    break
+    
+    new_segments, tf_ans = _extract_tf_answer(segments)
+    return new_segments, is_correct, tf_ans
 
 def _extract_inline_options(paragraph, options_text_start):
     spans, full_text = get_para_elements(paragraph)
@@ -363,8 +409,8 @@ def _extract_inline_options(paragraph, options_text_start):
         abs_start = options_text_start + m.start(letter)
         abs_end = options_text_start + m.end(letter)
         segs = _seg_slice(spans, abs_start, abs_end)
-        segs, is_correct = _mark_option_correctness(segs)
-        options.append(Option(letter, segs, is_correct))
+        segs, is_correct, tf_ans = _mark_option_correctness(segs)
+        options.append(Option(letter, segs, is_correct, tf_ans))
     stem_end_abs = options_text_start + m.start('A')
     return options, stem_end_abs
 
@@ -375,8 +421,8 @@ def _extract_pair(paragraph, la, lb):
     out = []
     for letter, key in ((la, "X"), (lb, "Y")):
         segs = _seg_slice(spans, m.start(key), m.end(key))
-        segs, ok = _mark_option_correctness(segs)
-        out.append(Option(letter, segs, ok))
+        segs, is_correct, tf_ans = _mark_option_correctness(segs)
+        out.append(Option(letter, segs, is_correct, tf_ans))
     return out
 
 def _extract_separate_options(paragraphs4, letters="ABCD"):
@@ -384,9 +430,12 @@ def _extract_separate_options(paragraphs4, letters="ABCD"):
     for letter, p in zip(letters, paragraphs4):
         spans, full_text = get_para_elements(p)
         segs = _seg_slice(spans, 0, len(full_text))
-        segs, is_correct = _mark_option_correctness(segs)
-        options.append(Option(letter, segs, is_correct))
+        segs, is_correct, tf_ans = _mark_option_correctness(segs)
+        options.append(Option(letter, segs, is_correct, tf_ans))
     return options
+
+def _spec_text(spec):
+    return "".join(t for el, t, _s, _n in spec.segments).replace("\u200b", "")
 
 def parse_exam(docx_path):
     doc = Document(docx_path)
@@ -483,15 +532,31 @@ def parse_exam(docx_path):
                 qb.options = []
                 qb.options_mode = None
 
-        questions.append(qb)
         fillers_after[qid] = []
         for i in range(cursor, next_marker_idx):
             fillers_after[qid].append(_make_para_spec(paragraphs[i]))
 
-    return {"doc_path": docx_path, "prelude": prelude, "questions": questions, "fillers_after": fillers_after}
+        # Trích xuất đáp án ngắn (Phần 3)
+        found_ans = False
+        for i in reversed(range(len(fillers_after[qid]))):
+            ptxt = _spec_text(fillers_after[qid][i])
+            if ANS_RE.match(ptxt):
+                qb.short_answer_spec = fillers_after[qid][i]
+                fillers_after[qid].pop(i)
+                found_ans = True
+                break
+                
+        if not found_ans:
+            for i in reversed(range(len(qb.stem_paragraphs))):
+                ptxt = _spec_text(qb.stem_paragraphs[i])
+                if ANS_RE.match(ptxt):
+                    qb.short_answer_spec = qb.stem_paragraphs[i]
+                    qb.stem_paragraphs.pop(i)
+                    break
 
-def _spec_text(spec):
-    return "".join(t for el, t, _s, _n in spec.segments).replace("\u200b", "")
+        questions.append(qb)
+
+    return {"doc_path": docx_path, "prelude": prelude, "questions": questions, "fillers_after": fillers_after}
 
 def _spec_has_content(spec):
     for el, t, _s, _n in spec.segments:
@@ -696,7 +761,6 @@ def shuffle_plan(parsed, parts, opts, rng=None):
             
     return global_header, blocks, option_perm, number_str_map, new_order
 
-# Sao chép và thao tác an toàn lên thẻ XML
 def _copy_seg_run(paragraph, seg, new_number_str, num_replaced, strip_underline=False):
     el, sliced_t, needs_slicing, is_num = seg
     new_el = copy.deepcopy(el)
@@ -716,7 +780,6 @@ def _copy_seg_run(paragraph, seg, new_number_str, num_replaced, strip_underline=
             else:
                 out_text = ""
         
-        # CHỈ tác động vào text node w:t nếu bắt buộc phải cắt đoạn text. Hình vẽ/Công thức sẽ bỏ qua bước này.
         if needs_slicing or is_num:
             t_nodes = new_el.findall(qn('w:t'))
             if t_nodes:
@@ -846,32 +909,75 @@ def render_exam_docx(parsed, global_header, blocks, option_perm, number_str_map,
     if sect_prs: body.append(copy.deepcopy(sect_prs[-1]))
     doc.save(out_path)
 
-def compute_answer_key(new_order, option_perm, number_str_map):
+def compute_answer_key(blocks, option_perm, number_str_map, qmap, parts):
     result = []
-    for old_q_id in new_order:
-        opts = option_perm[old_q_id]
-        correct_letter = None
-        if opts and opts[0].letter_orig in "abcd":
-            if any(o.is_correct for o in opts):
-                correct_letter = "".join("Đ" if o.is_correct else "S" for o in opts)
-        else:
-            for i, opt in enumerate(opts):
-                if opt.is_correct: correct_letter = "ABCD"[i]; break
-        result.append((number_str_map[old_q_id], correct_letter))
+    for block in blocks:
+        part_idx = block["part_idx"]
+        part_info = parts[part_idx]
+        is_part2 = "PHẦN II" in part_info["label"].upper() or "PHẦN 2" in part_info["label"].upper()
+        is_part3 = "PHẦN III" in part_info["label"].upper() or "PHẦN 3" in part_info["label"].upper()
+        
+        for old_q_id in block["qids"]:
+            q = qmap[old_q_id]
+            opts = option_perm[old_q_id]
+            correct_ans = None
+            
+            if is_part3:
+                correct_ans = getattr(q, 'short_answer_spec', None)
+            elif is_part2 and opts:
+                ans_str = ""
+                for opt in opts:
+                    ans_str += opt.tf_ans if getattr(opt, 'tf_ans', None) else "?"
+                correct_ans = ans_str
+            else:
+                if opts and opts[0].letter_orig in "abcd":
+                    if any(o.is_correct for o in opts):
+                        correct_ans = "".join("Đ" if o.is_correct else "S" for o in opts)
+                else:
+                    for i, opt in enumerate(opts):
+                        if opt.is_correct: 
+                            correct_ans = "ABCD"[i]; break
+            result.append((number_str_map[old_q_id], correct_ans))
     return result
+
+def _strip_ans_prefix(segments):
+    new_segs = list(segments)
+    for i, (el, text, ns, is_num) in enumerate(new_segs):
+        if el.tag == qn('w:r'):
+            m = re.search(r'(?:Đáp\s*án|ĐS|Kết\s*quả|ĐÁP\s*ÁN)\s*[:\.]\s*', text, re.IGNORECASE)
+            if m:
+                new_t = text[m.end():]
+                new_segs[i] = (el, new_t, True, is_num)
+                for j in range(i):
+                    new_segs[j] = (new_segs[j][0], "", True, new_segs[j][3])
+                break
+    return new_segs
 
 def build_answer_key_docx(all_keys, out_path):
     doc = Document()
     doc.add_heading("BẢNG ĐÁP ÁN", level=1)
     for ma_de_label, keys in all_keys:
         doc.add_heading(ma_de_label, level=2)
-        table = doc.add_table(rows=0, cols=10)
+        has_spec = any(isinstance(k[1], ParaSpec) for k in keys)
+        cols = 5 if has_spec else 10 
+        
+        table = doc.add_table(rows=0, cols=cols)
         table.style = "Table Grid"
-        for i in range(0, len(keys), 10):
+        
+        for i in range(0, len(keys), cols):
             row_cells = table.add_row().cells
-            for j, (num_str, letter) in enumerate(keys[i:i + 10]):
-                shown = CIRCLED.get(letter, letter) if letter else "?"
-                row_cells[j].text = f"{num_str}. {shown}"
+            for j, (num_str, ans_obj) in enumerate(keys[i:i + cols]):
+                cell = row_cells[j]
+                if isinstance(ans_obj, ParaSpec):
+                    p = cell.paragraphs[0]
+                    p.add_run(f"{num_str}. ")
+                    stripped_segs = _strip_ans_prefix(ans_obj.segments)
+                    num_replaced = [False]
+                    for seg in stripped_segs:
+                        _copy_seg_run(p, seg, None, num_replaced)
+                else:
+                    shown = CIRCLED.get(ans_obj, ans_obj) if ans_obj else "?"
+                    cell.text = f"{num_str}. {shown}"
     doc.save(out_path)
 </script>
 
@@ -914,8 +1020,10 @@ def generate_shuffled(options_json):
         header_line = f"Mã đề: {ma_de}" if insert_header else None
         out_path = f"/MaDe_{ma_de}.docx"
         engine.render_exam_docx(G_PARSED, global_header, blocks, option_perm, number_str_map, out_path, header_line=header_line)
+        
+        qmap = {q.id: q for q in G_PARSED["questions"]}
         for b in blocks:
-            ks = engine.compute_answer_key(b["qids"], option_perm, number_str_map)
+            ks = engine.compute_answer_key([b], option_perm, number_str_map, qmap, G_PARTS)
             lbl = f"Mã đề {ma_de}" if len(blocks) == 1 else f"Mã đề {ma_de} – Phần {(b['part_idx'] or 0) + 1}"
             all_keys.append((lbl, ks))
         
@@ -1039,7 +1147,7 @@ def generate_shuffled(options_json):
             let optsDisabled = isPart3 ? "disabled" : "";
             let optsOpacity = isPart3 ? "opacity-40 cursor-not-allowed grayscale" : "cursor-pointer hover:bg-slate-50";
             let optsChecked = isPart3 ? "" : "checked";
-            let optsNote = isPart3 ? `<p class="text-[11px] text-rose-500 mt-2 font-semibold">* Phần 3 tự động vô hiệu hóa xáo phương án</p>` : "";
+            let optsNote = isPart3 ? `<p class="text-[11px] text-rose-500 mt-2 font-semibold">* Phần 3 tự động vô hiệu hóa tính năng xáo phương án</p>` : "";
 
             container.innerHTML += `
                 <div class="animate-fade-in bg-white border ${part.explicit_lock ? 'border-rose-200 shadow-rose-100' : 'border-slate-200'} rounded-2xl p-5 shadow-sm hover:shadow-md transition-all duration-300">
