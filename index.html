@@ -212,60 +212,51 @@ import random
 from docx import Document
 from docx.oxml.ns import qn
 from docx.text.run import Run as _DocxRun
+from docx.oxml import OxmlElement
 
-# Cập nhật Regex cho định dạng 2026 của Bộ GD&ĐT
 QUESTION_RE = re.compile(r'Câu\s+(\d+)\s*\.', re.IGNORECASE)
 PART_RE = re.compile(r'PHẦN\s+([IVX123]+)', re.IGNORECASE)
 OPTION_START_RE = re.compile(r'^\s*([ABCD])\.\s')
 INLINE_OPTIONS_RE = re.compile(r'(?P<A>A\.\s.*?)(?=\t?\s*B\.\s)\t?\s*(?P<B>B\.\s.*?)(?=\t?\s*C\.\s)\t?\s*(?P<C>C\.\s.*?)(?=\t?\s*D\.\s)\t?\s*(?P<D>D\.\s.*)$', re.DOTALL)
 CIRCLED = {"A": "\u24B6", "B": "\u24B7", "C": "\u24B8", "D": "\u24B9"}
 
-def flatten_runs(paragraph):
+# THUẬT TOÁN MỚI: Đọc nguyên trạng thẻ XML thay vì chỉ đọc Text
+def get_para_elements(paragraph):
     spans = []
-    pos = [0]
-    def walk(el):
-        for child in el:
-            tag = child.tag
-            if tag == qn('w:r'):
-                run = _DocxRun(child, paragraph)
-                t = run.text
-                if t:
-                    spans.append((pos[0], pos[0] + len(t), run))
-                    pos[0] += len(t)
-            elif tag == qn('w:pPr'): continue
-            else: walk(child)
-    walk(paragraph._p)
-    return spans
+    pos = 0
+    full_text = ""
+    for child in paragraph._p:
+        tag = child.tag
+        if tag == qn('w:pPr'): continue
+        
+        if tag == qn('w:r'):
+            t = _DocxRun(child, paragraph).text or ""
+        else:
+            t = " " # Giữ chỗ cho công thức toán (m:oMath) hoặc hình ảnh (w:drawing)
+            
+        length = len(t)
+        if length == 0:
+            t = "\u200B" # Zero-width space để định vị độ dài
+            length = 1
+            
+        spans.append((pos, pos + length, child, t))
+        pos += length
+        full_text += t
+    return spans, full_text
 
-def para_text(paragraph): return "".join(r.text for _s, _e, r in flatten_runs(paragraph))
-
-def slice_text_runs(spans, start, end):
-    out = []
-    for s, e, r in spans:
-        if e <= start or s >= end: continue
-        seg_start = max(s, start)
-        seg_end = min(e, end)
-        text = r.text[seg_start - s: seg_end - s]
-        if text: out.append((text, r))
-    return out
-
-def run_has_underline(run):
-    rpr = run._r.find(qn('w:rPr'))
-    if rpr is None: return False
-    u = rpr.find(qn('w:u'))
-    if u is None: return False
-    val = u.get(qn('w:val'))
-    return val not in (None, 'none', '0', 'false')
+def para_text(paragraph): 
+    _, text = get_para_elements(paragraph)
+    return text
 
 def copy_rpr(new_run, source_run, strip_underline=False):
-    src_rpr = source_run._r.find(qn('w:rPr'))
+    src_rpr = source_run.find(qn('w:rPr'))
     if src_rpr is not None:
         new_rpr = copy.deepcopy(src_rpr)
         if strip_underline:
             for u in list(new_rpr.findall(qn('w:u'))): new_rpr.remove(u)
-        old = new_run._r.find(qn('w:rPr'))
-        if old is not None: new_run._r.remove(old)
-        new_run._r.insert(0, new_rpr)
+        old = new_run.find(qn('w:rPr'))
+        if old is not None: new_run.remove(old)
+        new_run.insert(0, new_rpr)
 
 def copy_ppr(new_paragraph, source_paragraph):
     src_ppr = source_paragraph._p.find(qn('w:pPr'))
@@ -298,37 +289,63 @@ class QuestionBlock:
         self.options_mode = None
         self.options_ppr_source = None
 
+# Thuật toán cắt XML siêu an toàn để không làm hỏng MathType/Equation
 def _seg_slice(spans, a, b, number_span=None):
     segments = []
-    if number_span and a <= number_span[0] and number_span[1] <= b:
-        ns, ne = number_span
-        if a < ns:
-            for t, r in slice_text_runs(spans, a, ns): segments.append((t, r, False, False))
-        for t, r in slice_text_runs(spans, ns, ne): segments.append((t, r, False, True))
-        if ne < b:
-            for t, r in slice_text_runs(spans, ne, b): segments.append((t, r, False, False))
-    else:
-        for t, r in slice_text_runs(spans, a, b): segments.append((t, r, False, False))
+    splits = {a, b}
+    if number_span:
+        splits.add(number_span[0])
+        splits.add(number_span[1])
+        
+    for s, e, el, t in spans:
+        if e <= a or s >= b: continue
+        
+        if el.tag == qn('w:r'):
+            local_splits = sorted(list(set(sp - s for sp in splits if s < sp < e)))
+            curr = 0
+            for ls in local_splits + [len(t)]:
+                if curr == ls: continue
+                chunk_s = s + curr
+                chunk_e = s + ls
+                
+                if chunk_s >= b or chunk_e <= a: 
+                    curr = ls
+                    continue
+                    
+                is_num = number_span and (number_span[0] <= chunk_s < number_span[1])
+                sliced_t = t[curr:ls]
+                segments.append((el, sliced_t, True, is_num))
+                curr = ls
+        else:
+            # Giữ nguyên khối XML đối với hình ảnh và công thức
+            segments.append((el, t, False, False))
+            
     return segments
 
 def _make_para_spec(paragraph, a=0, b=None, number_span=None):
-    text = para_text(paragraph)
-    if b is None: b = len(text)
-    spans = flatten_runs(paragraph)
+    spans, full_text = get_para_elements(paragraph)
+    if b is None: b = len(full_text)
     segments = _seg_slice(spans, a, b, number_span)
     return ParaSpec(paragraph, segments)
 
 def _mark_option_correctness(segments):
     if not segments: return segments, False
-    is_correct = any(run_has_underline(r) for _t, r, _su, _isn in segments)
-    if is_correct:
-        segments = [(t, r, True, isn) for (t, r, _su, isn) in segments]
+    is_correct = False
+    for el, sliced_t, needs_slicing, is_num in segments:
+        if el.tag == qn('w:r'):
+            rpr = el.find(qn('w:rPr'))
+            if rpr is not None:
+                u = rpr.find(qn('w:u'))
+                if u is not None:
+                    val = u.get(qn('w:val'))
+                    if val not in (None, 'none', '0', 'false'):
+                        is_correct = True
+                        break
     return segments, is_correct
 
 def _extract_inline_options(paragraph, options_text_start):
-    text = para_text(paragraph)
-    spans = flatten_runs(paragraph)
-    sub = text[options_text_start:]
+    spans, full_text = get_para_elements(paragraph)
+    sub = full_text[options_text_start:]
     m = INLINE_OPTIONS_RE.search(sub)
     if not m: return None, None
     options = []
@@ -344,9 +361,8 @@ def _extract_inline_options(paragraph, options_text_start):
 def _extract_separate_options(paragraphs4):
     options = []
     for letter, p in zip("ABCD", paragraphs4):
-        text = para_text(p)
-        spans = flatten_runs(p)
-        segs = _seg_slice(spans, 0, len(text))
+        spans, full_text = get_para_elements(p)
+        segs = _seg_slice(spans, 0, len(full_text))
         segs, is_correct = _mark_option_correctness(segs)
         options.append(Option(letter, segs, is_correct))
     return options
@@ -370,7 +386,7 @@ def parse_exam(docx_path):
 
     for mi_pos, idx in enumerate(marker_indices):
         qnum = marker_at[idx]
-        qid = mi_pos # Map qua ID tuyến tính thay vì số câu để hỗ trợ lặp số câu
+        qid = mi_pos 
         num_span = marker_span_at[idx]
         qb = QuestionBlock(qid, qnum)
         marker_para = paragraphs[idx]
@@ -426,7 +442,6 @@ def parse_exam(docx_path):
 
     return {"doc_path": docx_path, "prelude": prelude, "questions": questions, "fillers_after": fillers_after}
 
-# Quét cấu trúc đề dựa theo cụm từ "PHẦN"
 def detect_parts(parsed):
     parts = []
     questions = parsed["questions"]
@@ -437,7 +452,7 @@ def detect_parts(parsed):
 
     def extract_part_label(specs):
         for spec in specs:
-            text = "".join(seg[0] for seg in spec.segments).strip()
+            text = "".join(seg[1] for seg in spec.segments).strip()
             if "PHẦN" in text.upper(): return text
         return None
 
@@ -471,7 +486,6 @@ def detect_parts(parsed):
             "from_regex": False
         })
 
-    # Render cho giao diện
     for p in parts:
         p["q_from"] = parsed["questions"][p["q_from_id"]].number
         p["q_to"] = parsed["questions"][p["q_to_id"]].number
@@ -508,8 +522,7 @@ def shuffle_plan(parsed, parts, opts, rng=None):
                 else: block["specs_internal"][q_id] = parsed["fillers_after"].get(q_id, [])
             else: block["specs_internal"][q_id] = parsed["fillers_after"].get(q_id, [])
                 
-    shuffle_parts_globally = opts.get("shuffle_parts", False)
-    if shuffle_parts_globally:
+    if opts.get("shuffle_parts", False):
         rng.shuffle(blocks)
         
     option_perm = {}
@@ -534,7 +547,6 @@ def shuffle_plan(parsed, parts, opts, rng=None):
     new_order = []
     for block in blocks: new_order.extend(block["qids"])
         
-    # Reset số thứ tự tịnh tiến (từ 1) độc lập cho từng phần (khối)
     number_str_map = {}
     for block in blocks:
         for pos, old_q_id in enumerate(block["qids"]):
@@ -542,51 +554,66 @@ def shuffle_plan(parsed, parts, opts, rng=None):
             
     return global_header, blocks, option_perm, number_str_map, new_order
 
-def _copy_seg_run(paragraph, seg, new_number_str=None):
-    text, run, strip_u, is_number = seg
-    out_text = new_number_str if (is_number and new_number_str is not None) else text
+# Sao chép và thao tác an toàn lên thẻ XML
+def _copy_seg_run(paragraph, seg, new_number_str, num_replaced, strip_underline=False):
+    el, sliced_t, needs_slicing, is_num = seg
+    new_el = copy.deepcopy(el)
+    
+    if strip_underline and new_el.tag == qn('w:r'):
+        rpr = new_el.find(qn('w:rPr'))
+        if rpr is not None:
+            for u in list(rpr.findall(qn('w:u'))):
+                rpr.remove(u)
+                
+    if new_el.tag == qn('w:r'):
+        out_text = sliced_t
+        if is_num and new_number_str is not None:
+            if not num_replaced[0]:
+                out_text = new_number_str
+                num_replaced[0] = True
+            else:
+                out_text = ""
         
-    r = paragraph.add_run(out_text)
-    copy_rpr(r, run, strip_underline=strip_u)
-    return r
+        if needs_slicing or is_num:
+            t_nodes = new_el.findall(qn('w:t'))
+            if t_nodes:
+                t_nodes[0].text = out_text
+                for t_node in t_nodes[1:]:
+                    t_node.text = "" 
+            else:
+                if out_text:
+                    new_t = OxmlElement('w:t')
+                    new_t.text = out_text
+                    new_el.append(new_t)
+                    
+    paragraph._p.append(new_el)
 
 def _emit_plain_paragraph(doc, spec):
     p = doc.add_paragraph()
     copy_ppr(p, spec.source_paragraph)
+    num_replaced = [False]
     for seg in spec.segments: 
-        _copy_seg_run(p, seg)
+        _copy_seg_run(p, seg, None, num_replaced)
     return p
 
-_LEADING_LETTER_RE = re.compile(r'^(\s*)([ABCD])(\.)')
-
-def _relabel_first_char(segments, new_letter):
-    if not segments: return segments
-    combined = ""
-    for seg_text, _r, _su, _isn in segments[:4]:
-        combined += seg_text
-        if len(combined) >= 6: break
-    m = _LEADING_LETTER_RE.match(combined)
-    if not m: return segments
-    letter_pos = m.start(2)
-
-    new_segments = list(segments)
-    pos = 0
-    for idx, (text, run, strip_u, is_number) in enumerate(new_segments):
-        seg_len = len(text)
-        if pos <= letter_pos < pos + seg_len:
-            local_i = letter_pos - pos
-            new_text = text[:local_i] + new_letter + text[local_i + 1:]
-            new_segments[idx] = (new_text, run, strip_u, is_number)
+def _relabel_option_segments(segments, new_letter):
+    mod_segments = list(segments)
+    for i, (el, sliced_t, needs_slicing, is_num) in enumerate(mod_segments):
+        if el.tag == qn('w:r') and sliced_t.strip():
+            m = re.search(r'[ABCD]', sliced_t)
+            if m:
+                new_t = sliced_t[:m.start()] + new_letter + sliced_t[m.end():]
+                mod_segments[i] = (el, new_t, True, is_num)
             break
-        pos += seg_len
-    return new_segments
+    return mod_segments
 
 def _emit_option_run(paragraph, opt, new_letter, is_first_of_opt):
     segments = opt.segments
     if is_first_of_opt:
-        segments = _relabel_first_char(segments, new_letter)
+        segments = _relabel_option_segments(segments, new_letter)
+    num_replaced = [False]
     for seg in segments:
-        _copy_seg_run(paragraph, seg)
+        _copy_seg_run(paragraph, seg, None, num_replaced, strip_underline=True)
 
 def render_exam_docx(parsed, global_header, blocks, option_perm, number_str_map, out_path, header_line=None):
     doc = Document(parsed["doc_path"])
@@ -616,26 +643,29 @@ def render_exam_docx(parsed, global_header, blocks, option_perm, number_str_map,
             if q.options_mode == 'inline_with_marker':
                 p = doc.add_paragraph()
                 copy_ppr(p, q.stem_paragraphs[0].source_paragraph)
+                num_replaced = [False]
                 for seg in q.stem_paragraphs[0].segments: 
-                    _copy_seg_run(p, seg, new_number_str=new_num_str)
+                    _copy_seg_run(p, seg, new_num_str, num_replaced)
                 for i, opt in enumerate(opts):
                     if i > 0:
                         tab_run = p.add_run("\t")
-                        if opt.segments: copy_rpr(tab_run, opt.segments[0][1], strip_underline=True)
+                        if opt.segments: copy_rpr(tab_run._r, opt.segments[0][0], strip_underline=True)
                     _emit_option_run(p, opt, "ABCD"[i], True)
             else:
                 for sp in q.stem_paragraphs:
                     p = doc.add_paragraph()
                     copy_ppr(p, sp.source_paragraph)
+                    num_replaced = [False]
                     for seg in sp.segments: 
-                        _copy_seg_run(p, seg, new_number_str=new_num_str)
+                        _copy_seg_run(p, seg, new_num_str, num_replaced)
+                        
                 if q.options_mode == 'same_line':
                     p = doc.add_paragraph()
                     copy_ppr(p, q.options_ppr_source)
                     for i, opt in enumerate(opts):
                         if i > 0:
                             tab_run = p.add_run("\t")
-                            if opt.segments: copy_rpr(tab_run, opt.segments[0][1], strip_underline=True)
+                            if opt.segments: copy_rpr(tab_run._r, opt.segments[0][0], strip_underline=True)
                         _emit_option_run(p, opt, "ABCD"[i], True)
                 elif q.options_mode == 'separate':
                     for i, opt in enumerate(opts):
