@@ -222,7 +222,6 @@ OPTION_START_RE = re.compile(r'^\s*([ABCD])\.\s')
 INLINE_OPTIONS_RE = re.compile(r'(?P<A>A\.\s.*?)(?=\t?\s*B\.\s)\t?\s*(?P<B>B\.\s.*?)(?=\t?\s*C\.\s)\t?\s*(?P<C>C\.\s.*?)(?=\t?\s*D\.\s)\t?\s*(?P<D>D\.\s.*)$', re.DOTALL)
 CIRCLED = {"A": "\u24B6", "B": "\u24B7", "C": "\u24B8", "D": "\u24B9"}
 
-# THUẬT TOÁN MỚI: Đọc nguyên trạng thẻ XML thay vì chỉ đọc Text
 class _TableItem:
     is_table = True
     def __init__(self, tbl): self._p = tbl
@@ -239,11 +238,11 @@ def get_para_elements(paragraph):
         if tag == qn('w:r'):
             t = _DocxRun(child, paragraph).text or ""
         else:
-            t = " " # Giữ chỗ cho công thức toán (m:oMath) hoặc hình ảnh (w:drawing)
+            t = " " # Giữ chỗ cho công thức toán hoặc hình ảnh (w:drawing/m:oMath)
             
         length = len(t)
         if length == 0:
-            t = "\u200B" # Zero-width space để định vị độ dài
+            t = "\u200B" # Zero-width space để định vị
             length = 1
             
         spans.append((pos, pos + length, child, t))
@@ -298,7 +297,6 @@ class QuestionBlock:
         self.options_ppr_source = None
         self.options_ppr_source2 = None
 
-# Thuật toán cắt XML siêu an toàn để không làm hỏng MathType/Equation
 def _seg_slice(spans, a, b, number_span=None):
     segments = []
     splits = {a, b}
@@ -312,6 +310,7 @@ def _seg_slice(spans, a, b, number_span=None):
         if el.tag == qn('w:r'):
             local_splits = sorted(list(set(sp - s for sp in splits if s < sp < e)))
             curr = 0
+            needs_slicing = len(local_splits) > 0 # Chìa khóa: Nếu Run không vướng ranh giới cắt thì không chạm vào text bên trong
             for ls in local_splits + [len(t)]:
                 if curr == ls: continue
                 chunk_s = s + curr
@@ -323,7 +322,7 @@ def _seg_slice(spans, a, b, number_span=None):
                     
                 is_num = number_span and (number_span[0] <= chunk_s < number_span[1])
                 sliced_t = t[curr:ls]
-                segments.append((el, sliced_t, True, is_num))
+                segments.append((el, sliced_t, needs_slicing, is_num))
                 curr = ls
         else:
             # Giữ nguyên khối XML đối với hình ảnh và công thức
@@ -535,7 +534,6 @@ def _header_specs(parsed, i, qids):
     return list(reversed(tail))
 
 def _detect_segments(parsed, part):
-    # Nhóm = câu in đậm (đề bài chung) đứng trước một dãy câu. Nhóm "shared" (có đoạn văn / nêu số câu) mặc định được giữ nguyên.
     qids = list(range(part["q_from_id"], part["q_to_id"] + 1))
     n = len(qids)
     num_at = {parsed["questions"][q].number: k for k, q in enumerate(qids)}
@@ -578,6 +576,7 @@ def detect_parts(parsed):
 
     def extract_part_label(specs):
         for spec in specs:
+            if spec.table: continue
             text = "".join(seg[1] for seg in spec.segments).strip()
             if "PHẦN" in text.upper(): return text
         return None
@@ -660,8 +659,9 @@ def shuffle_plan(parsed, parts, opts, rng=None):
         if p_idx is not None:
             cfg = opts.get(p_idx, {})
             part_info = parts[p_idx]
+            is_part3 = "PHẦN III" in part_info["label"].upper() or "PHẦN 3" in part_info["label"].upper()
             
-            if cfg.get("shuffle_options"):
+            if cfg.get("shuffle_options") and not is_part3:
                 for q_id in block["qids"]:
                     if q_id in qmap and len(qmap[q_id].options) == 4:
                         order = [0, 1, 2, 3]
@@ -680,7 +680,6 @@ def shuffle_plan(parsed, parts, opts, rng=None):
                         if not locked: rng.shuffle(g)
                         new_qids.extend(g)
                 if segs and sorted(new_qids) == sorted(block["qids"]):
-                    # đoạn văn/đề bài chung neo theo VỊ TRÍ (không đi theo câu)
                     slot_fillers = [block["specs_internal"].get(q, []) for q in block["qids"]]
                     block["qids"] = new_qids
                     block["specs_internal"] = {q: slot_fillers[pos] for pos, q in enumerate(new_qids)}
@@ -717,6 +716,7 @@ def _copy_seg_run(paragraph, seg, new_number_str, num_replaced, strip_underline=
             else:
                 out_text = ""
         
+        # CHỈ tác động vào text node w:t nếu bắt buộc phải cắt đoạn text. Hình vẽ/Công thức sẽ bỏ qua bước này.
         if needs_slicing or is_num:
             t_nodes = new_el.findall(qn('w:t'))
             if t_nodes:
@@ -724,7 +724,7 @@ def _copy_seg_run(paragraph, seg, new_number_str, num_replaced, strip_underline=
                 for t_node in t_nodes[1:]:
                     t_node.text = "" 
             else:
-                if out_text:
+                if out_text and out_text != "\u200B":
                     new_t = OxmlElement('w:t')
                     new_t.text = out_text
                     new_el.append(new_t)
@@ -755,11 +755,11 @@ def _relabel_option_segments(segments, new_letter):
     mod_segments = list(segments)
     for i, (el, sliced_t, needs_slicing, is_num) in enumerate(mod_segments):
         if el.tag == qn('w:r') and sliced_t.strip():
-            m = re.search(r'[ABCD]', sliced_t)
+            m = re.search(r'[ABCDabcd]', sliced_t)
             if m:
                 new_t = sliced_t[:m.start()] + new_letter + sliced_t[m.end():]
                 mod_segments[i] = (el, new_t, True, is_num)
-            break
+                break
     return mod_segments
 
 def _emit_option_run(paragraph, opt, new_letter, is_first_of_opt):
@@ -1017,6 +1017,7 @@ def generate_shuffled(options_json):
         
         parts.forEach((part, index) => {
             let lockState = part.is_cloze;
+            let isPart3 = part.label.toUpperCase().includes("PHẦN III") || part.label.toUpperCase().includes("PHẦN 3");
             
             let lockIcon = lockState 
                 ? `<div class="flex items-center bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100"><svg class="w-4 h-4 text-rose-500 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg><span class="text-[11px] font-bold text-rose-600 uppercase tracking-wider">Khóa thứ tự câu</span></div>`
@@ -1031,8 +1032,14 @@ def generate_shuffled(options_json):
                     <span class="flex items-center text-[12px] font-semibold text-indigo-700"><input type="checkbox" id="opt-seg-${index}-${si}" ${sg.shared ? 'checked' : ''} class="w-4 h-4 mr-1.5 accent-indigo-600">Giữ nguyên</span>
                 </label>`;
             }).join('') : `<div class="text-[12px] text-slate-500 px-2 py-1">Không phát hiện câu in đậm dẫn nhóm → cả khối đảo tự do.</div>`;
-            let toggleDisabled = lockState ? "disabled" : "";
-            let toggleOpacity = lockState ? "opacity-40 cursor-not-allowed grayscale" : "cursor-pointer hover:bg-slate-50";
+            
+            let orderDisabled = lockState ? "disabled" : "";
+            let orderOpacity = lockState ? "opacity-40 cursor-not-allowed grayscale" : "cursor-pointer hover:bg-slate-50";
+
+            let optsDisabled = isPart3 ? "disabled" : "";
+            let optsOpacity = isPart3 ? "opacity-40 cursor-not-allowed grayscale" : "cursor-pointer hover:bg-slate-50";
+            let optsChecked = isPart3 ? "" : "checked";
+            let optsNote = isPart3 ? `<p class="text-[11px] text-rose-500 mt-2 font-semibold">* Phần 3 tự động vô hiệu hóa xáo phương án</p>` : "";
 
             container.innerHTML += `
                 <div class="animate-fade-in bg-white border ${part.explicit_lock ? 'border-rose-200 shadow-rose-100' : 'border-slate-200'} rounded-2xl p-5 shadow-sm hover:shadow-md transition-all duration-300">
@@ -1051,26 +1058,31 @@ def generate_shuffled(options_json):
                         </div>
                     </div>
                     
-                    <div class="flex items-center space-x-4 border-t border-slate-100 pt-4">
-                        <label class="flex-1 flex items-center justify-between p-2 rounded-lg cursor-pointer hover:bg-slate-50 transition-colors border border-transparent hover:border-slate-100">
-                            <span class="text-sm font-semibold text-slate-700">Xáo phương án (A,B,C,D)</span>
-                            <div class="relative ml-3">
-                                <input type="checkbox" id="opt-opts-${index}" checked class="sr-only toggle-checkbox">
-                                <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
-                                <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
-                            </div>
-                        </label>
+                    <div class="flex items-start space-x-4 border-t border-slate-100 pt-4">
+                        <div class="flex-1">
+                            <label class="flex items-center justify-between p-2 rounded-lg ${optsOpacity} transition-colors border border-transparent ${!isPart3 ? 'hover:border-slate-100' : ''}">
+                                <span class="text-sm font-semibold ${isPart3 ? 'text-slate-400' : 'text-slate-700'}">Xáo phương án (A,B,C,D)</span>
+                                <div class="relative ml-3">
+                                    <input type="checkbox" id="opt-opts-${index}" ${optsChecked} ${optsDisabled} class="sr-only toggle-checkbox">
+                                    <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
+                                    <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
+                                </div>
+                            </label>
+                            ${optsNote}
+                        </div>
 
                         <div class="w-px h-8 bg-slate-200"></div>
 
-                        <label class="flex-1 flex items-center justify-between p-2 rounded-lg ${toggleOpacity} transition-colors border border-transparent ${!lockState ? 'hover:border-slate-100' : ''}">
-                            <span class="text-sm font-semibold ${lockState ? 'text-slate-400' : 'text-slate-700'}">Đảo câu (Nội bộ)</span>
-                            <div class="relative ml-3">
-                                <input type="checkbox" id="opt-order-${index}" ${!lockState ? 'checked' : ''} ${toggleDisabled} onchange="syncGroupToggle(${index})" class="sr-only toggle-checkbox">
-                                <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
-                                <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
-                            </div>
-                        </label>
+                        <div class="flex-1">
+                            <label class="flex items-center justify-between p-2 rounded-lg ${orderOpacity} transition-colors border border-transparent ${!lockState ? 'hover:border-slate-100' : ''}">
+                                <span class="text-sm font-semibold ${lockState ? 'text-slate-400' : 'text-slate-700'}">Đảo câu (Nội bộ)</span>
+                                <div class="relative ml-3">
+                                    <input type="checkbox" id="opt-order-${index}" ${!lockState ? 'checked' : ''} ${orderDisabled} onchange="syncGroupToggle(${index})" class="sr-only toggle-checkbox">
+                                    <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
+                                    <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
+                                </div>
+                            </label>
+                        </div>
                     </div>
 
                     <div id="group-row-${index}" class="border-t border-slate-100 mt-4 pt-3 ${lockState ? 'opacity-40' : ''}">
