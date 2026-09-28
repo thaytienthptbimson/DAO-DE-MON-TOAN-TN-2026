@@ -442,8 +442,10 @@ def parse_exam(docx_path):
 
     return {"doc_path": docx_path, "prelude": prelude, "questions": questions, "fillers_after": fillers_after}
 
+def _spec_text(spec):
+    return "".join(t for el, t, _s, _n in spec.segments).replace("\u200b", "")
+
 def _spec_has_content(spec):
-    # Đoạn có chữ/công thức thật (không tính dòng trống, bookmark, ảnh đơn thuần)
     for el, t, _s, _n in spec.segments:
         if el.tag == qn('w:r'):
             if t.replace("\u200b", "").strip(): return True
@@ -452,18 +454,70 @@ def _spec_has_content(spec):
             if "".join(el.itertext()).replace("\u200b", "").strip(): return True
     return False
 
-def _detect_groups(parsed, part):
-    # Nhóm = dãy câu liên tiếp; ranh giới nhóm = có đoạn văn/đề bài chung nằm xen giữa 2 câu
+def _run_is_bold(el, para):
+    rpr = el.find(qn('w:rPr'))
+    if rpr is not None:
+        b = rpr.find(qn('w:b'))
+        if b is not None:
+            return b.get(qn('w:val')) not in ('0', 'false', 'off')
+    try:
+        return bool(para.style.font.bold)
+    except Exception:
+        return False
+
+def _spec_is_bold(spec):
+    total = bold = 0
+    for el, t, _s, _n in spec.segments:
+        if el.tag != qn('w:r'): continue
+        n = sum(1 for c in t if not c.isspace() and c != "\u200b")
+        if n == 0: continue
+        total += n
+        if _run_is_bold(el, spec.source_paragraph): bold += n
+    return total > 0 and bold / total >= 0.6
+
+def _header_specs(parsed, i, qids):
+    if i > 0:
+        return list(parsed["fillers_after"].get(qids[i - 1], []))
+    specs = list(parsed["prelude"]) if qids[0] == 0 else list(parsed["fillers_after"].get(qids[0] - 1, []))
+    tail = []
+    for sp in reversed(specs):
+        if _spec_has_content(sp): tail.append(sp)
+        elif tail: break
+    return list(reversed(tail))
+
+def _detect_segments(parsed, part):
+    # Nhóm = câu in đậm (đề bài chung) đứng trước một dãy câu. Nhóm "shared" (có đoạn văn / nêu số câu) mặc định được giữ nguyên.
     qids = list(range(part["q_from_id"], part["q_to_id"] + 1))
-    groups, cur = [], []
-    for q_id in qids:
-        cur.append(q_id)
-        if q_id != qids[-1]:
-            if any(_spec_has_content(sp) for sp in parsed["fillers_after"].get(q_id, [])):
-                groups.append(cur)
-                cur = []
-    if cur: groups.append(cur)
-    return groups
+    n = len(qids)
+    num_at = {parsed["questions"][q].number: k for k, q in enumerate(qids)}
+    heads = {}
+    for i in range(n):
+        specs = _header_specs(parsed, i, qids)
+        bold = [sp for sp in specs if _spec_has_content(sp) and _spec_is_bold(sp) and "PHẦN" not in _spec_text(sp).upper()]
+        if bold:
+            heads[i] = (bold, [sp for sp in specs if sp not in bold and _spec_has_content(sp)])
+    starts = sorted(heads)
+    segments, cursor = [], 0
+    for si, i in enumerate(starts):
+        bold, others = heads[i]
+        nxt = starts[si + 1] if si + 1 < len(starts) else n
+        end = nxt - 1
+        text = " ".join(_spec_text(sp) for sp in bold)
+        ks = [num_at[x] for x in (int(v) for v in re.findall(r'\d+', text)) if x in num_at and num_at[x] >= i]
+        j = max(ks) if ks and min(ks) == i else None
+        if j is not None and j < end: end = j
+        refs = j is not None and j > i and not (i == 0 and j == n - 1)
+        passage = i > 0 and len(others) > 0
+        if i > cursor:
+            segments.append({"qids": qids[cursor:i], "header": False, "shared": False})
+        segments.append({"qids": qids[i:end + 1], "header": True, "shared": bool(refs or passage)})
+        cursor = end + 1
+    if cursor < n:
+        segments.append({"qids": qids[cursor:], "header": False, "shared": False})
+    for sg in segments:
+        sg["q_from"] = parsed["questions"][sg["qids"][0]].number
+        sg["q_to"] = parsed["questions"][sg["qids"][-1]].number
+    return segments
 
 def detect_parts(parsed):
     parts = []
@@ -512,8 +566,7 @@ def detect_parts(parsed):
     for p in parts:
         p["q_from"] = parsed["questions"][p["q_from_id"]].number
         p["q_to"] = parsed["questions"][p["q_to_id"]].number
-        p["groups"] = _detect_groups(parsed, p)
-        p["group_ranges"] = [[parsed["questions"][g[0]].number, parsed["questions"][g[-1]].number] for g in p["groups"]]
+        p["segments"] = _detect_segments(parsed, p)
 
     return parts
 
@@ -567,14 +620,19 @@ def shuffle_plan(parsed, parts, opts, rng=None):
                         option_perm[q_id] = [qmap[q_id].options[idx] for idx in order]
                         
             if cfg.get("shuffle_order") and not part_info["is_cloze"] and len(block["qids"]) > 1:
-                if cfg.get("keep_groups", True) and part_info.get("groups"):
-                    # Đảo riêng từng nhóm; nhóm giữ nguyên vị trí, đoạn văn/đề bài chung neo theo vị trí (không đi theo câu)
-                    slot_fillers = [block["specs_internal"].get(q, []) for q in block["qids"]]
-                    new_qids = []
-                    for grp in part_info["groups"]:
-                        g = list(grp)
-                        rng.shuffle(g)
+                segs = part_info.get("segments")
+                new_qids = []
+                if segs:
+                    locks = cfg.get("locks")
+                    for si, seg in enumerate(segs):
+                        g = list(seg["qids"])
+                        if locks is not None and si < len(locks): locked = bool(locks[si])
+                        else: locked = seg["header"] and seg["shared"]
+                        if not locked: rng.shuffle(g)
                         new_qids.extend(g)
+                if segs and sorted(new_qids) == sorted(block["qids"]):
+                    # đoạn văn/đề bài chung neo theo VỊ TRÍ (không đi theo câu)
+                    slot_fillers = [block["specs_internal"].get(q, []) for q in block["qids"]]
                     block["qids"] = new_qids
                     block["specs_internal"] = {q: slot_fillers[pos] for pos, q in enumerate(new_qids)}
                 else:
@@ -868,8 +926,9 @@ def generate_shuffled(options_json):
 
     function syncGroupToggle(index) {
         const on = document.getElementById(`opt-order-${index}`).checked;
-        document.getElementById(`opt-group-${index}`).disabled = !on;
-        document.getElementById(`group-row-${index}`).classList.toggle('opacity-40', !on);
+        document.querySelectorAll(`[id^="opt-seg-${index}-"]`).forEach(el => el.disabled = !on);
+        const row = document.getElementById(`group-row-${index}`);
+        if (row) row.classList.toggle('opacity-40', !on);
     }
 
     function renderPartsUI(parts) {
@@ -884,10 +943,15 @@ def generate_shuffled(options_json):
                 ? `<div class="flex items-center bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100"><svg class="w-4 h-4 text-rose-500 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg><span class="text-[11px] font-bold text-rose-600 uppercase tracking-wider">Khóa thứ tự câu</span></div>`
                 : `<div class="flex items-center bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-100"><svg class="w-4 h-4 text-emerald-500 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"></path></svg><span class="text-[11px] font-bold text-emerald-600 uppercase tracking-wider">Cho phép đảo câu</span></div>`;
 
-            const nGroups = (part.groups || []).length;
-            const groupInfo = nGroups > 1
-                ? (part.group_ranges || []).map((r, gi) => `<span class="text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-md px-2 py-0.5">Nhóm ${gi + 1}: ${r[0] === r[1] ? 'Câu ' + r[0] : 'Câu ' + r[0] + '–' + r[1]}</span>`).join('')
-                : `<span class="text-[11px] text-slate-500">Không phát hiện đoạn văn/đề bài chung xen giữa các câu → cả khối là một nhóm.</span>`;
+            const segs = part.segments || [];
+            const segRows = segs.some(sg => sg.header) ? segs.map((sg, si) => {
+                const rg = sg.q_from === sg.q_to ? `Câu ${sg.q_from}` : `Câu ${sg.q_from}–${sg.q_to}`;
+                if (!sg.header) return `<div class="text-[12px] text-slate-500 px-2 py-1">${rg}: không có câu in đậm dẫn nhóm (đảo tự do)</div>`;
+                return `<label class="flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-slate-50 cursor-pointer">
+                    <span class="text-[13px] text-slate-700"><b>Nhóm ${rg}</b> <span class="text-slate-400">(${sg.shared ? 'có đoạn văn/đề chung' : 'chỉ có câu dẫn in đậm'})</span></span>
+                    <span class="flex items-center text-[12px] font-semibold text-indigo-700"><input type="checkbox" id="opt-seg-${index}-${si}" ${sg.shared ? 'checked' : ''} class="w-4 h-4 mr-1.5 accent-indigo-600">Giữ nguyên</span>
+                </label>`;
+            }).join('') : `<div class="text-[12px] text-slate-500 px-2 py-1">Không phát hiện câu in đậm dẫn nhóm → cả khối đảo tự do.</div>`;
             let toggleDisabled = lockState ? "disabled" : "";
             let toggleOpacity = lockState ? "opacity-40 cursor-not-allowed grayscale" : "cursor-pointer hover:bg-slate-50";
 
@@ -931,16 +995,9 @@ def generate_shuffled(options_json):
                     </div>
 
                     <div id="group-row-${index}" class="border-t border-slate-100 mt-4 pt-3 ${lockState ? 'opacity-40' : ''}">
-                        <label class="flex items-center justify-between p-2 rounded-lg ${lockState ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-slate-50'} transition-colors">
-                            <span class="text-sm font-semibold text-slate-700">Giữ câu trong nhóm khi đảo <span class="text-xs font-normal text-slate-500">(${nGroups} nhóm)</span></span>
-                            <div class="relative ml-3">
-                                <input type="checkbox" id="opt-group-${index}" checked ${toggleDisabled} class="sr-only toggle-checkbox">
-                                <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
-                                <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
-                            </div>
-                        </label>
-                        <p class="text-[11px] text-slate-500 px-2 mt-1">Câu chỉ đảo trong phạm vi nhóm của nó; nhóm và đoạn văn/đề bài chung giữ nguyên vị trí.</p>
-                        <div class="flex flex-wrap gap-1.5 px-2 mt-2">${groupInfo}</div>
+                        <p class="text-[11px] font-bold text-slate-600 uppercase tracking-wider px-2 mb-1">Nhóm nhận diện bằng câu in đậm</p>
+                        ${segRows}
+                        <p class="text-[11px] text-slate-500 px-2 mt-1">Tích "Giữ nguyên": nhóm giữ nguyên vị trí và thứ tự câu bên trong. Bỏ tích: câu chỉ đảo trong phạm vi nhóm.</p>
                     </div>
                 </div>
             `;
@@ -1058,7 +1115,7 @@ def generate_shuffled(options_json):
                 opts[idx] = {
                     shuffle_options: document.getElementById(`opt-opts-${idx}`).checked,
                     shuffle_order: document.getElementById(`opt-order-${idx}`).checked,
-                    keep_groups: document.getElementById(`opt-group-${idx}`).checked
+                    locks: (part.segments || []).map((sg, si) => { const el = document.getElementById(`opt-seg-${idx}-${si}`); return el ? el.checked : false; })
                 };
             });
             
