@@ -442,6 +442,29 @@ def parse_exam(docx_path):
 
     return {"doc_path": docx_path, "prelude": prelude, "questions": questions, "fillers_after": fillers_after}
 
+def _spec_has_content(spec):
+    # Đoạn có chữ/công thức thật (không tính dòng trống, bookmark, ảnh đơn thuần)
+    for el, t, _s, _n in spec.segments:
+        if el.tag == qn('w:r'):
+            if t.replace("\u200b", "").strip(): return True
+        else:
+            if el.tag.endswith('}oMath') or el.tag.endswith('}oMathPara'): return True
+            if "".join(el.itertext()).replace("\u200b", "").strip(): return True
+    return False
+
+def _detect_groups(parsed, part):
+    # Nhóm = dãy câu liên tiếp; ranh giới nhóm = có đoạn văn/đề bài chung nằm xen giữa 2 câu
+    qids = list(range(part["q_from_id"], part["q_to_id"] + 1))
+    groups, cur = [], []
+    for q_id in qids:
+        cur.append(q_id)
+        if q_id != qids[-1]:
+            if any(_spec_has_content(sp) for sp in parsed["fillers_after"].get(q_id, [])):
+                groups.append(cur)
+                cur = []
+    if cur: groups.append(cur)
+    return groups
+
 def detect_parts(parsed):
     parts = []
     questions = parsed["questions"]
@@ -489,6 +512,8 @@ def detect_parts(parsed):
     for p in parts:
         p["q_from"] = parsed["questions"][p["q_from_id"]].number
         p["q_to"] = parsed["questions"][p["q_to_id"]].number
+        p["groups"] = _detect_groups(parsed, p)
+        p["group_ranges"] = [[parsed["questions"][g[0]].number, parsed["questions"][g[-1]].number] for g in p["groups"]]
 
     return parts
 
@@ -542,7 +567,18 @@ def shuffle_plan(parsed, parts, opts, rng=None):
                         option_perm[q_id] = [qmap[q_id].options[idx] for idx in order]
                         
             if cfg.get("shuffle_order") and not part_info["is_cloze"] and len(block["qids"]) > 1:
-                rng.shuffle(block["qids"])
+                if cfg.get("keep_groups", True) and part_info.get("groups"):
+                    # Đảo riêng từng nhóm; nhóm giữ nguyên vị trí, đoạn văn/đề bài chung neo theo vị trí (không đi theo câu)
+                    slot_fillers = [block["specs_internal"].get(q, []) for q in block["qids"]]
+                    new_qids = []
+                    for grp in part_info["groups"]:
+                        g = list(grp)
+                        rng.shuffle(g)
+                        new_qids.extend(g)
+                    block["qids"] = new_qids
+                    block["specs_internal"] = {q: slot_fillers[pos] for pos, q in enumerate(new_qids)}
+                else:
+                    rng.shuffle(block["qids"])
                 
     new_order = []
     for block in blocks: new_order.extend(block["qids"])
@@ -830,6 +866,12 @@ def generate_shuffled(options_json):
         reader.readAsDataURL(file);
     }
 
+    function syncGroupToggle(index) {
+        const on = document.getElementById(`opt-order-${index}`).checked;
+        document.getElementById(`opt-group-${index}`).disabled = !on;
+        document.getElementById(`group-row-${index}`).classList.toggle('opacity-40', !on);
+    }
+
     function renderPartsUI(parts) {
         const container = document.getElementById('parts-container');
         container.innerHTML = '';
@@ -842,6 +884,10 @@ def generate_shuffled(options_json):
                 ? `<div class="flex items-center bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100"><svg class="w-4 h-4 text-rose-500 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg><span class="text-[11px] font-bold text-rose-600 uppercase tracking-wider">Khóa thứ tự câu</span></div>`
                 : `<div class="flex items-center bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-100"><svg class="w-4 h-4 text-emerald-500 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"></path></svg><span class="text-[11px] font-bold text-emerald-600 uppercase tracking-wider">Cho phép đảo câu</span></div>`;
 
+            const nGroups = (part.groups || []).length;
+            const groupInfo = nGroups > 1
+                ? (part.group_ranges || []).map((r, gi) => `<span class="text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-md px-2 py-0.5">Nhóm ${gi + 1}: ${r[0] === r[1] ? 'Câu ' + r[0] : 'Câu ' + r[0] + '–' + r[1]}</span>`).join('')
+                : `<span class="text-[11px] text-slate-500">Không phát hiện đoạn văn/đề bài chung xen giữa các câu → cả khối là một nhóm.</span>`;
             let toggleDisabled = lockState ? "disabled" : "";
             let toggleOpacity = lockState ? "opacity-40 cursor-not-allowed grayscale" : "cursor-pointer hover:bg-slate-50";
 
@@ -877,11 +923,24 @@ def generate_shuffled(options_json):
                         <label class="flex-1 flex items-center justify-between p-2 rounded-lg ${toggleOpacity} transition-colors border border-transparent ${!lockState ? 'hover:border-slate-100' : ''}">
                             <span class="text-sm font-semibold ${lockState ? 'text-slate-400' : 'text-slate-700'}">Đảo câu (Nội bộ)</span>
                             <div class="relative ml-3">
-                                <input type="checkbox" id="opt-order-${index}" ${!lockState ? 'checked' : ''} ${toggleDisabled} class="sr-only toggle-checkbox">
+                                <input type="checkbox" id="opt-order-${index}" ${!lockState ? 'checked' : ''} ${toggleDisabled} onchange="syncGroupToggle(${index})" class="sr-only toggle-checkbox">
                                 <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
                                 <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
                             </div>
                         </label>
+                    </div>
+
+                    <div id="group-row-${index}" class="border-t border-slate-100 mt-4 pt-3 ${lockState ? 'opacity-40' : ''}">
+                        <label class="flex items-center justify-between p-2 rounded-lg ${lockState ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-slate-50'} transition-colors">
+                            <span class="text-sm font-semibold text-slate-700">Giữ câu trong nhóm khi đảo <span class="text-xs font-normal text-slate-500">(${nGroups} nhóm)</span></span>
+                            <div class="relative ml-3">
+                                <input type="checkbox" id="opt-group-${index}" checked ${toggleDisabled} class="sr-only toggle-checkbox">
+                                <div class="block bg-slate-200 w-10 h-6 rounded-full toggle-label transition-colors"></div>
+                                <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform shadow-sm toggle-dot"></div>
+                            </div>
+                        </label>
+                        <p class="text-[11px] text-slate-500 px-2 mt-1">Câu chỉ đảo trong phạm vi nhóm của nó; nhóm và đoạn văn/đề bài chung giữ nguyên vị trí.</p>
+                        <div class="flex flex-wrap gap-1.5 px-2 mt-2">${groupInfo}</div>
                     </div>
                 </div>
             `;
@@ -998,7 +1057,8 @@ def generate_shuffled(options_json):
             window.currentParts.forEach((part, idx) => {
                 opts[idx] = {
                     shuffle_options: document.getElementById(`opt-opts-${idx}`).checked,
-                    shuffle_order: document.getElementById(`opt-order-${idx}`).checked
+                    shuffle_order: document.getElementById(`opt-order-${idx}`).checked,
+                    keep_groups: document.getElementById(`opt-group-${idx}`).checked
                 };
             });
             
